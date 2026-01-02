@@ -168,6 +168,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // State update
   void update_state();
   void read_all_registers();
+  void read_next_register();  // Non-blocking: reads one register per call
 
   // Configuration
   uint8_t slave_id_{MODBUS_DEFAULT_SLAVE_ID};
@@ -177,6 +178,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // Timing
   uint32_t last_update_{0};
   uint32_t last_request_{0};
+  uint8_t current_register_index_{0};  // For non-blocking sequential register reads
 
   // Optional sensors
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
