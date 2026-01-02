@@ -63,8 +63,8 @@ void GreeAC::setup() {
     this->flow_control_pin_->digital_write(false);  // Start in receive mode
   }
 
-  // Initial state read
-  this->read_all_registers();
+  // Don't read registers here - it blocks too long and triggers watchdog
+  // First read will happen in loop() after setup completes
 }
 
 void GreeAC::loop() {
