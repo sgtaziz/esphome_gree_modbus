@@ -7,6 +7,7 @@ Tested with: Gree GFH36K3FI / GUHD36NK3FO
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
+from esphome import pins
 from esphome.components import climate, uart, sensor, select, switch
 from esphome.const import (
     CONF_ID,
@@ -32,6 +33,7 @@ GreeACSelect = gree_ac_ns.class_(
 
 # Configuration keys
 CONF_SLAVE_ID = "slave_id"
+CONF_FLOW_CONTROL_PIN = "flow_control_pin"
 CONF_OUTDOOR_TEMPERATURE = "outdoor_temperature"
 CONF_VERTICAL_SWING_SELECT = "vertical_swing_select"
 CONF_HORIZONTAL_SWING_SELECT = "horizontal_swing_select"
@@ -93,6 +95,7 @@ CONFIG_SCHEMA = (
             cv.Optional(
                 CONF_UPDATE_INTERVAL, default="5s"
             ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_OUTDOOR_TEMPERATURE): outdoor_temp_schema,
             cv.Optional(CONF_VERTICAL_SWING_SELECT): select_schema,
             cv.Optional(CONF_HORIZONTAL_SWING_SELECT): select_schema,
@@ -114,6 +117,11 @@ async def to_code(config):
 
     cg.add(var.set_slave_id(config[CONF_SLAVE_ID]))
     cg.add(var.set_update_interval(config[CONF_UPDATE_INTERVAL]))
+
+    # Flow control pin (DE/RE for MAX485 modules)
+    if CONF_FLOW_CONTROL_PIN in config:
+        pin = await cg.gpio_pin_expression(config[CONF_FLOW_CONTROL_PIN])
+        cg.add(var.set_flow_control_pin(pin))
 
     # Outdoor temperature sensor
     if CONF_OUTDOOR_TEMPERATURE in config:

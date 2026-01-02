@@ -57,6 +57,12 @@ uint16_t GreeAC::calculate_crc(uint8_t *data, uint8_t len) {
 void GreeAC::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Gree AC Modbus...");
 
+  // Initialize flow control pin (DE/RE for MAX485 modules)
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->setup();
+    this->flow_control_pin_->digital_write(false);  // Start in receive mode
+  }
+
   // Initial state read
   this->read_all_registers();
 }
@@ -76,6 +82,9 @@ void GreeAC::dump_config() {
   ESP_LOGCONFIG(TAG, "  Version: %s", VERSION);
   ESP_LOGCONFIG(TAG, "  Slave ID: %d", this->slave_id_);
   ESP_LOGCONFIG(TAG, "  Update Interval: %d ms", this->update_interval_);
+  if (this->flow_control_pin_ != nullptr) {
+    LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
+  }
   LOG_CLIMATE("", "Gree AC", this);
   if (this->outdoor_temp_sensor_ != nullptr) {
     LOG_SENSOR("  ", "Outdoor Temperature", this->outdoor_temp_sensor_);
@@ -242,9 +251,20 @@ bool GreeAC::send_modbus_request(uint8_t *request, uint8_t req_len, uint8_t *res
     this->read();
   }
 
+  // Enable transmit mode for MAX485 modules
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->digital_write(true);
+    delayMicroseconds(50);  // Small delay for transceiver to switch
+  }
+
   // Send request
   this->write_array(request, req_len);
   this->flush();
+
+  // Switch back to receive mode
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->digital_write(false);
+  }
 
   // Wait for response with timeout
   uint32_t start = millis();

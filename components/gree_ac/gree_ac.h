@@ -29,6 +29,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/gpio.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
@@ -135,6 +136,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // Configuration setters
   void set_slave_id(uint8_t slave_id) { this->slave_id_ = slave_id; }
   void set_update_interval(uint32_t interval) { this->update_interval_ = interval; }
+  void set_flow_control_pin(GPIOPin *pin) { this->flow_control_pin_ = pin; }
 
   // Optional component setters (implementations in cpp with callbacks)
   void set_outdoor_temperature_sensor(sensor::Sensor *sensor) { this->outdoor_temp_sensor_ = sensor; }
@@ -170,6 +172,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // Configuration
   uint8_t slave_id_{MODBUS_DEFAULT_SLAVE_ID};
   uint32_t update_interval_{5000};  // 5 seconds default
+  GPIOPin *flow_control_pin_{nullptr};  // DE/RE pin for MAX485 modules
 
   // Timing
   uint32_t last_update_{0};

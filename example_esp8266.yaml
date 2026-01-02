@@ -47,6 +47,10 @@ climate:
     slave_id: ${slave_id}
     update_interval: 5s
 
+    # Flow control pin for MAX485 modules (controls DE/RE pins)
+    # Not needed for auto-direction RS485 modules - remove or comment out
+    flow_control_pin: GPIO2
+
     # Optional sensors and controls
     outdoor_temperature:
       name: "${friendly_name} Outdoor Temperature"

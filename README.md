@@ -26,6 +26,21 @@ Connect your RS485 transceiver to the COM-BMS / CN3 board:
 
 UART settings: 9600 baud, 8N1
 
+### RS485 Module Types
+
+**Auto-direction modules** (recommended): These modules automatically switch between TX and RX modes. Just connect VCC, GND, TX, and RX - no additional GPIO needed.
+
+**MAX485 modules** (with DE/RE pins): These require manual direction control. Wire DE and RE together to a GPIO pin and configure `flow_control_pin` in your YAML:
+
+```
+ESP32          MAX485
+GPIO17  -----> DI
+GPIO16  <----- RO
+GPIO4   -----> DE + RE (directly connect or jumper together. Try only DE first - might work)
+3.3V    -----> VCC
+GND     -----> GND
+```
+
 ## Installation
 
 Add to your ESPHome YAML:
@@ -66,6 +81,7 @@ climate:
     name: "Gree AC"
     slave_id: 1
     update_interval: 5s
+    flow_control_pin: GPIO4  # Optional: only for MAX485 modules
     outdoor_temperature:
       name: "Outdoor Temperature"
     vertical_swing_select:
