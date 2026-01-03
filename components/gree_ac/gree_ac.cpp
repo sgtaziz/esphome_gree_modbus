@@ -409,6 +409,15 @@ void GreeAC::check_response() {
         } else {
           this->action = climate::CLIMATE_ACTION_IDLE;
         }
+      } else if (this->mode_ == modes::AUTO) {
+        // Auto mode: determine if heating or cooling based on temperature difference
+        if (this->current_temp_ > this->target_temp_) {
+          this->action = climate::CLIMATE_ACTION_COOLING;
+        } else if (this->current_temp_ < this->target_temp_) {
+          this->action = climate::CLIMATE_ACTION_HEATING;
+        } else {
+          this->action = climate::CLIMATE_ACTION_IDLE;
+        }
       } else {
         this->action = climate::CLIMATE_ACTION_IDLE;
       }
@@ -792,6 +801,15 @@ void GreeAC::read_all_registers() {
     }
   } else if (this->mode_ == modes::HEAT) {
     if (this->current_temp_ < this->target_temp_) {
+      this->action = climate::CLIMATE_ACTION_HEATING;
+    } else {
+      this->action = climate::CLIMATE_ACTION_IDLE;
+    }
+  } else if (this->mode_ == modes::AUTO) {
+    // Auto mode: determine if heating or cooling based on temperature difference
+    if (this->current_temp_ > this->target_temp_) {
+      this->action = climate::CLIMATE_ACTION_COOLING;
+    } else if (this->current_temp_ < this->target_temp_) {
       this->action = climate::CLIMATE_ACTION_HEATING;
     } else {
       this->action = climate::CLIMATE_ACTION_IDLE;

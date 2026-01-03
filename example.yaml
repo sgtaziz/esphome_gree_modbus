@@ -67,3 +67,34 @@ climate:
 
     fresh_air_switch:
       name: "${friendly_name} Fresh Air"
+
+# Diagnostic sensors
+sensor:
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    unit_of_measurement: "h"
+    filters:
+      - lambda: return x / 3600.0;
+
+# Diagnostic buttons
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+
+  - platform: safe_mode
+    name: "${friendly_name} Safe Mode"
+
+# Diagnostic text sensors
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+    ssid:
+      name: "${friendly_name} Connected SSID"
+
+  - platform: version
+    name: "${friendly_name} ESPHome Version"
