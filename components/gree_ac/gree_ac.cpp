@@ -70,14 +70,24 @@ void GreeAC::setup() {
 void GreeAC::loop() {
   uint32_t now = millis();
 
-  // Read one register per loop iteration to avoid watchdog timeout
-  // Spread register reads across update_interval / number_of_registers
-  uint32_t read_interval = this->update_interval_ / 10;  // ~10 registers to read
-  if (read_interval < 100) read_interval = 100;  // Minimum 100ms between reads
+  // Async state machine for Modbus communication
+  switch (this->modbus_state_) {
+    case ModbusState::IDLE: {
+      // Time to send next register request?
+      uint32_t read_interval = this->update_interval_ / 10;
+      if (read_interval < 100) read_interval = 100;
 
-  if (now - this->last_update_ >= read_interval) {
-    this->last_update_ = now;
-    this->read_next_register();
+      if (now - this->last_update_ >= read_interval) {
+        this->last_update_ = now;
+        this->read_next_register();  // This now just sends the request
+      }
+      break;
+    }
+
+    case ModbusState::WAITING_RESPONSE: {
+      this->check_response();  // Non-blocking check for response
+      break;
+    }
   }
 }
 
@@ -290,6 +300,252 @@ bool GreeAC::send_modbus_request(uint8_t *request, uint8_t req_len, uint8_t *res
 
   *resp_len = idx;
   return idx > 0;
+}
+
+void GreeAC::send_read_request(uint16_t reg_addr) {
+  // Clear RX buffer
+  while (this->available()) {
+    this->read();
+  }
+
+  // Build read request (function 0x03)
+  uint8_t request[8];
+  request[0] = this->slave_id_;
+  request[1] = 0x03;  // Read holding registers
+  request[2] = reg_addr >> 8;
+  request[3] = reg_addr & 0xFF;
+  request[4] = 0x00;  // Count high
+  request[5] = 0x01;  // Count low (1 register)
+
+  uint16_t crc = this->calculate_crc(request, 6);
+  request[6] = crc & 0xFF;
+  request[7] = crc >> 8;
+
+  // Enable transmit mode for MAX485 modules
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->digital_write(true);
+    delayMicroseconds(50);
+  }
+
+  // Send request
+  this->write_array(request, 8);
+  this->flush();
+
+  // Switch back to receive mode
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->digital_write(false);
+  }
+
+  // Set up async state
+  this->pending_register_ = reg_addr;
+  this->response_index_ = 0;
+  this->request_start_time_ = millis();
+  this->last_byte_time_ = 0;
+  this->modbus_state_ = ModbusState::WAITING_RESPONSE;
+}
+
+void GreeAC::check_response() {
+  uint32_t now = millis();
+
+  // Check for timeout (500ms)
+  if (now - this->request_start_time_ > 500) {
+    ESP_LOGW(TAG, "No response reading register %d", this->pending_register_);
+    this->modbus_state_ = ModbusState::IDLE;
+    this->current_register_index_ = (this->current_register_index_ + 1) % 10;
+    return;
+  }
+
+  // Read available bytes (non-blocking)
+  while (this->available() && this->response_index_ < 64) {
+    this->response_buffer_[this->response_index_++] = this->read();
+    this->last_byte_time_ = now;
+  }
+
+  // Check for frame complete (silence after receiving data)
+  if (this->response_index_ > 0 && now - this->last_byte_time_ > 10) {
+    // Validate response
+    if (this->response_index_ >= 7 &&
+        this->response_buffer_[0] == this->slave_id_ &&
+        this->response_buffer_[1] == 0x03) {
+
+      // Verify CRC
+      uint16_t rx_crc = this->response_buffer_[this->response_index_ - 2] |
+                        (this->response_buffer_[this->response_index_ - 1] << 8);
+      uint16_t calc_crc = this->calculate_crc(this->response_buffer_, this->response_index_ - 2);
+
+      if (rx_crc == calc_crc) {
+        // Extract value and process
+        uint16_t value = (this->response_buffer_[3] << 8) | this->response_buffer_[4];
+        this->process_register_response(this->pending_register_, value);
+      } else {
+        ESP_LOGW(TAG, "CRC mismatch reading register %d", this->pending_register_);
+      }
+    } else if (this->response_index_ > 0) {
+      ESP_LOGW(TAG, "Invalid response reading register %d: %d bytes", this->pending_register_, this->response_index_);
+    }
+
+    // Move to next register
+    this->modbus_state_ = ModbusState::IDLE;
+    this->current_register_index_ = (this->current_register_index_ + 1) % 10;
+
+    // Publish state after last register
+    if (this->current_register_index_ == 0) {
+      // Determine action based on state
+      if (!this->ac_on_) {
+        this->action = climate::CLIMATE_ACTION_OFF;
+      } else if (this->mode_ == modes::FAN_ONLY) {
+        this->action = climate::CLIMATE_ACTION_FAN;
+      } else if (this->mode_ == modes::DRY) {
+        this->action = climate::CLIMATE_ACTION_DRYING;
+      } else if (this->mode_ == modes::COOL) {
+        if (this->current_temp_ > this->target_temp_) {
+          this->action = climate::CLIMATE_ACTION_COOLING;
+        } else {
+          this->action = climate::CLIMATE_ACTION_IDLE;
+        }
+      } else if (this->mode_ == modes::HEAT) {
+        if (this->current_temp_ < this->target_temp_) {
+          this->action = climate::CLIMATE_ACTION_HEATING;
+        } else {
+          this->action = climate::CLIMATE_ACTION_IDLE;
+        }
+      } else {
+        this->action = climate::CLIMATE_ACTION_IDLE;
+      }
+      this->publish_state();
+    }
+  }
+}
+
+void GreeAC::process_register_response(uint16_t reg_addr, uint16_t value) {
+  switch (reg_addr) {
+    case registers::ON_OFF:
+      this->ac_on_ = (value == AC_ON);
+      break;
+
+    case registers::MODE:
+      this->mode_ = value;
+      switch (value) {
+        case modes::COOL:
+          this->mode = climate::CLIMATE_MODE_COOL;
+          break;
+        case modes::HEAT:
+          this->mode = climate::CLIMATE_MODE_HEAT;
+          break;
+        case modes::DRY:
+          this->mode = climate::CLIMATE_MODE_DRY;
+          break;
+        case modes::FAN_ONLY:
+          this->mode = climate::CLIMATE_MODE_FAN_ONLY;
+          break;
+        case modes::AUTO:
+          this->mode = climate::CLIMATE_MODE_HEAT_COOL;
+          break;
+      }
+      if (!this->ac_on_) {
+        this->mode = climate::CLIMATE_MODE_OFF;
+      }
+      break;
+
+    case registers::TEMP_SENSOR_3:
+      if (value & 0x8000) {
+        this->current_temp_ = -static_cast<float>(value & 0x7FFF) / 10.0f;
+      } else {
+        this->current_temp_ = static_cast<float>(value) / 10.0f;
+      }
+      this->current_temperature = this->current_temp_;
+      break;
+
+    case registers::SET_TEMP:
+      this->target_temp_ = static_cast<float>(value);
+      this->target_temperature = this->target_temp_;
+      break;
+
+    case registers::FAN_SPEED:
+      this->fan_speed_ = value;
+      switch (value) {
+        case fan_speeds::AUTO:
+          this->set_custom_fan_mode_("0 - Auto");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::SPEED_1:
+          this->set_custom_fan_mode_("1 - Speed 1");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::SPEED_2:
+          this->set_custom_fan_mode_("2 - Speed 2");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::SPEED_3:
+          this->set_custom_fan_mode_("3 - Speed 3");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::SPEED_4:
+          this->set_custom_fan_mode_("4 - Speed 4");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::SPEED_5:
+          this->set_custom_fan_mode_("5 - Speed 5");
+          this->turbo_mode_ = false;
+          break;
+        case fan_speeds::TURBO:
+          this->set_custom_fan_mode_("6 - Turbo");
+          this->turbo_mode_ = true;
+          break;
+      }
+      break;
+
+    case registers::VERTICAL_SWING:
+      this->vertical_swing_ = value;
+      if (this->vertical_swing_select_ != nullptr && value < VERTICAL_SWING_OPTIONS.size()) {
+        this->vertical_swing_select_->publish_state(VERTICAL_SWING_OPTIONS[value]);
+      }
+      break;
+
+    case registers::HORIZONTAL_SWING:
+      this->horizontal_swing_ = value;
+      if (this->horizontal_swing_select_ != nullptr && value < HORIZONTAL_SWING_OPTIONS.size()) {
+        this->horizontal_swing_select_->publish_state(HORIZONTAL_SWING_OPTIONS[value]);
+      }
+      // Update combined swing mode
+      if (this->vertical_swing_ > 0 && this->horizontal_swing_ > 0) {
+        this->swing_mode = climate::CLIMATE_SWING_BOTH;
+      } else if (this->vertical_swing_ > 0) {
+        this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
+      } else if (this->horizontal_swing_ > 0) {
+        this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
+      } else {
+        this->swing_mode = climate::CLIMATE_SWING_OFF;
+      }
+      break;
+
+    case registers::OUTDOOR_TEMP:
+      if (this->outdoor_temp_sensor_ != nullptr) {
+        float temp;
+        if (value & 0x8000) {
+          temp = -static_cast<float>(value & 0x7FFF);
+        } else {
+          temp = static_cast<float>(value);
+        }
+        this->outdoor_temp_ = temp;
+        this->outdoor_temp_sensor_->publish_state(temp);
+      }
+      break;
+
+    case registers::SLEEP_MODE:
+      this->sleep_mode_ = (value > 0);
+      if (this->sleep_switch_ != nullptr) {
+        this->sleep_switch_->publish_state(this->sleep_mode_);
+      }
+      break;
+
+    case registers::FRESH_AIR_VALVE:
+      this->fresh_air_ = (value > 0);
+      if (this->fresh_air_switch_ != nullptr) {
+        this->fresh_air_switch_->publish_state(this->fresh_air_);
+      }
+      break;
+  }
 }
 
 bool GreeAC::read_register(uint16_t reg_addr, uint16_t *value) {
@@ -548,194 +804,45 @@ void GreeAC::read_all_registers() {
 }
 
 void GreeAC::read_next_register() {
-  uint16_t value;
-  bool updated = false;
-
-  // Read one register based on current index, then advance
+  // Dispatch async read request based on current register index
+  // Response will be handled by check_response() -> process_register_response()
   switch (this->current_register_index_) {
-    case 0:  // On/Off state
-      if (this->read_register(registers::ON_OFF, &value)) {
-        this->ac_on_ = (value == AC_ON);
-        updated = true;
-      }
+    case 0:
+      this->send_read_request(registers::ON_OFF);
       break;
-
-    case 1:  // Mode
-      if (this->read_register(registers::MODE, &value)) {
-        this->mode_ = value;
-        switch (value) {
-          case modes::COOL:
-            this->mode = climate::CLIMATE_MODE_COOL;
-            break;
-          case modes::HEAT:
-            this->mode = climate::CLIMATE_MODE_HEAT;
-            break;
-          case modes::DRY:
-            this->mode = climate::CLIMATE_MODE_DRY;
-            break;
-          case modes::FAN_ONLY:
-            this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-            break;
-          case modes::AUTO:
-            this->mode = climate::CLIMATE_MODE_HEAT_COOL;
-            break;
-        }
-        // Override mode if AC is off
-        if (!this->ac_on_) {
-          this->mode = climate::CLIMATE_MODE_OFF;
-        }
-        updated = true;
-      }
+    case 1:
+      this->send_read_request(registers::MODE);
       break;
-
-    case 2:  // Current temperature
-      if (this->read_register(registers::TEMP_SENSOR_3, &value)) {
-        if (value & 0x8000) {
-          this->current_temp_ = -static_cast<float>(value & 0x7FFF) / 10.0f;
-        } else {
-          this->current_temp_ = static_cast<float>(value) / 10.0f;
-        }
-        this->current_temperature = this->current_temp_;
-        updated = true;
-      }
+    case 2:
+      this->send_read_request(registers::TEMP_SENSOR_3);
       break;
-
-    case 3:  // Set temperature
-      if (this->read_register(registers::SET_TEMP, &value)) {
-        this->target_temp_ = static_cast<float>(value);
-        this->target_temperature = this->target_temp_;
-        updated = true;
-      }
+    case 3:
+      this->send_read_request(registers::SET_TEMP);
       break;
-
-    case 4:  // Fan speed
-      if (this->read_register(registers::FAN_SPEED, &value)) {
-        this->fan_speed_ = value;
-        switch (value) {
-          case fan_speeds::AUTO:
-            this->set_custom_fan_mode_("0 - Auto");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::SPEED_1:
-            this->set_custom_fan_mode_("1 - Speed 1");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::SPEED_2:
-            this->set_custom_fan_mode_("2 - Speed 2");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::SPEED_3:
-            this->set_custom_fan_mode_("3 - Speed 3");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::SPEED_4:
-            this->set_custom_fan_mode_("4 - Speed 4");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::SPEED_5:
-            this->set_custom_fan_mode_("5 - Speed 5");
-            this->turbo_mode_ = false;
-            break;
-          case fan_speeds::TURBO:
-            this->set_custom_fan_mode_("6 - Turbo");
-            this->turbo_mode_ = true;
-            break;
-        }
-        updated = true;
-      }
+    case 4:
+      this->send_read_request(registers::FAN_SPEED);
       break;
-
-    case 5:  // Vertical swing
-      if (this->read_register(registers::VERTICAL_SWING, &value)) {
-        this->vertical_swing_ = value;
-        if (this->vertical_swing_select_ != nullptr && value < VERTICAL_SWING_OPTIONS.size()) {
-          this->vertical_swing_select_->publish_state(VERTICAL_SWING_OPTIONS[value]);
-        }
-        updated = true;
-      }
+    case 5:
+      this->send_read_request(registers::VERTICAL_SWING);
       break;
-
-    case 6:  // Horizontal swing
-      if (this->read_register(registers::HORIZONTAL_SWING, &value)) {
-        this->horizontal_swing_ = value;
-        if (this->horizontal_swing_select_ != nullptr && value < HORIZONTAL_SWING_OPTIONS.size()) {
-          this->horizontal_swing_select_->publish_state(HORIZONTAL_SWING_OPTIONS[value]);
-        }
-        // Update combined swing mode
-        if (this->vertical_swing_ > 0 && this->horizontal_swing_ > 0) {
-          this->swing_mode = climate::CLIMATE_SWING_BOTH;
-        } else if (this->vertical_swing_ > 0) {
-          this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
-        } else if (this->horizontal_swing_ > 0) {
-          this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
-        } else {
-          this->swing_mode = climate::CLIMATE_SWING_OFF;
-        }
-        updated = true;
-      }
+    case 6:
+      this->send_read_request(registers::HORIZONTAL_SWING);
       break;
-
-    case 7:  // Outdoor temperature (only if sensor configured)
+    case 7:
+      // Skip outdoor temp if sensor not configured
       if (this->outdoor_temp_sensor_ != nullptr) {
-        if (this->read_register(registers::OUTDOOR_TEMP, &value)) {
-          float temp;
-          if (value & 0x8000) {
-            temp = -static_cast<float>(value & 0x7FFF);
-          } else {
-            temp = static_cast<float>(value);
-          }
-          this->outdoor_temp_ = temp;
-          this->outdoor_temp_sensor_->publish_state(temp);
-        }
-      }
-      break;
-
-    case 8:  // Sleep mode
-      if (this->read_register(registers::SLEEP_MODE, &value)) {
-        this->sleep_mode_ = (value > 0);
-        if (this->sleep_switch_ != nullptr) {
-          this->sleep_switch_->publish_state(this->sleep_mode_);
-        }
-      }
-      break;
-
-    case 9:  // Fresh air valve - last register, update action and publish
-      if (this->read_register(registers::FRESH_AIR_VALVE, &value)) {
-        this->fresh_air_ = (value > 0);
-        if (this->fresh_air_switch_ != nullptr) {
-          this->fresh_air_switch_->publish_state(this->fresh_air_);
-        }
-      }
-
-      // Determine action based on state
-      if (!this->ac_on_) {
-        this->action = climate::CLIMATE_ACTION_OFF;
-      } else if (this->mode_ == modes::FAN_ONLY) {
-        this->action = climate::CLIMATE_ACTION_FAN;
-      } else if (this->mode_ == modes::DRY) {
-        this->action = climate::CLIMATE_ACTION_DRYING;
-      } else if (this->mode_ == modes::COOL) {
-        if (this->current_temp_ > this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_COOLING;
-        } else {
-          this->action = climate::CLIMATE_ACTION_IDLE;
-        }
-      } else if (this->mode_ == modes::HEAT) {
-        if (this->current_temp_ < this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_HEATING;
-        } else {
-          this->action = climate::CLIMATE_ACTION_IDLE;
-        }
+        this->send_read_request(registers::OUTDOOR_TEMP);
       } else {
-        this->action = climate::CLIMATE_ACTION_IDLE;
+        this->current_register_index_ = (this->current_register_index_ + 1) % 10;
       }
-
-      this->publish_state();
+      break;
+    case 8:
+      this->send_read_request(registers::SLEEP_MODE);
+      break;
+    case 9:
+      this->send_read_request(registers::FRESH_AIR_VALVE);
       break;
   }
-
-  // Advance to next register (wrap around after 9)
-  this->current_register_index_ = (this->current_register_index_ + 1) % 10;
 }
 
 void GreeAC::set_vertical_swing(uint16_t value) {

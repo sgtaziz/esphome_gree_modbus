@@ -170,6 +170,11 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   void read_all_registers();
   void read_next_register();  // Non-blocking: reads one register per call
 
+  // Async Modbus methods
+  void send_read_request(uint16_t reg_addr);  // Non-blocking: sends request
+  void check_response();  // Non-blocking: checks for response data
+  void process_register_response(uint16_t reg_addr, uint16_t value);  // Handles received data
+
   // Configuration
   uint8_t slave_id_{MODBUS_DEFAULT_SLAVE_ID};
   uint32_t update_interval_{5000};  // 5 seconds default
@@ -179,6 +184,18 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   uint32_t last_update_{0};
   uint32_t last_request_{0};
   uint8_t current_register_index_{0};  // For non-blocking sequential register reads
+
+  // Async Modbus state machine
+  enum class ModbusState : uint8_t {
+    IDLE,
+    WAITING_RESPONSE,
+  };
+  ModbusState modbus_state_{ModbusState::IDLE};
+  uint32_t request_start_time_{0};
+  uint8_t response_buffer_[64];
+  uint8_t response_index_{0};
+  uint32_t last_byte_time_{0};
+  uint16_t pending_register_{0};  // Register we're waiting for response from
 
   // Optional sensors
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
