@@ -36,7 +36,7 @@ UART settings: 9600 baud, 8N1
 ESP32          MAX485
 GPIO17  -----> DI
 GPIO16  <----- RO
-GPIO4   -----> DE + RE (directly connect or jumper together. Try only DE first - might work)
+GPIO4   -----> DE + RE (directly connect or jumper together. Try only RE first - might work)
 3.3V    -----> VCC
 GND     -----> GND
 ```
