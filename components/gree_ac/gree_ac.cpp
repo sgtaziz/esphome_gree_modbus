@@ -204,9 +204,8 @@ void GreeAC::control(const climate::ClimateCall &call) {
   }
 
   // Handle custom fan mode
-  auto custom_fan_opt = call.get_custom_fan_mode();
-  if (custom_fan_opt.has_value()) {
-    std::string custom_fan = *custom_fan_opt;
+  auto custom_fan = call.get_custom_fan_mode();
+  if (!custom_fan.empty()) {
     uint16_t modbus_fan = fan_speeds::AUTO;
 
     ESP_LOGD(TAG, "Setting fan mode: %s", custom_fan.c_str());
