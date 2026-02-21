@@ -204,19 +204,20 @@ void GreeAC::control(const climate::ClimateCall &call) {
   }
 
   // Handle custom fan mode
-  const char *custom_fan = call.get_custom_fan_mode();
-  if (custom_fan != nullptr) {
+  auto custom_fan_opt = call.get_custom_fan_mode();
+  if (custom_fan_opt.has_value()) {
+    std::string custom_fan = *custom_fan_opt;
     uint16_t modbus_fan = fan_speeds::AUTO;
 
-    ESP_LOGD(TAG, "Setting fan mode: %s", custom_fan);
+    ESP_LOGD(TAG, "Setting fan mode: %s", custom_fan.c_str());
 
-    if (strcmp(custom_fan, "0 - Auto") == 0) modbus_fan = fan_speeds::AUTO;
-    else if (strcmp(custom_fan, "1 - Speed 1") == 0) modbus_fan = fan_speeds::SPEED_1;
-    else if (strcmp(custom_fan, "2 - Speed 2") == 0) modbus_fan = fan_speeds::SPEED_2;
-    else if (strcmp(custom_fan, "3 - Speed 3") == 0) modbus_fan = fan_speeds::SPEED_3;
-    else if (strcmp(custom_fan, "4 - Speed 4") == 0) modbus_fan = fan_speeds::SPEED_4;
-    else if (strcmp(custom_fan, "5 - Speed 5") == 0) modbus_fan = fan_speeds::SPEED_5;
-    else if (strcmp(custom_fan, "6 - Turbo") == 0) modbus_fan = fan_speeds::TURBO;
+    if (custom_fan == "0 - Auto") modbus_fan = fan_speeds::AUTO;
+    else if (custom_fan == "1 - Speed 1") modbus_fan = fan_speeds::SPEED_1;
+    else if (custom_fan == "2 - Speed 2") modbus_fan = fan_speeds::SPEED_2;
+    else if (custom_fan == "3 - Speed 3") modbus_fan = fan_speeds::SPEED_3;
+    else if (custom_fan == "4 - Speed 4") modbus_fan = fan_speeds::SPEED_4;
+    else if (custom_fan == "5 - Speed 5") modbus_fan = fan_speeds::SPEED_5;
+    else if (custom_fan == "6 - Turbo") modbus_fan = fan_speeds::TURBO;
 
     this->write_register(registers::FAN_SPEED, modbus_fan);
     this->fan_speed_ = modbus_fan;
@@ -898,7 +899,7 @@ void GreeAC::set_fresh_air(bool enabled) {
 // Callback-based setters (like sinclair_ac pattern)
 void GreeAC::set_vertical_swing_select(select::Select *vertical_swing_select) {
   this->vertical_swing_select_ = vertical_swing_select;
-  this->vertical_swing_select_->add_on_state_callback([this](const std::string &value, size_t index) {
+  this->vertical_swing_select_->add_on_state_callback([this](size_t index) {
     if (index == this->vertical_swing_)
       return;
     this->set_vertical_swing(static_cast<uint16_t>(index));
@@ -907,7 +908,7 @@ void GreeAC::set_vertical_swing_select(select::Select *vertical_swing_select) {
 
 void GreeAC::set_horizontal_swing_select(select::Select *horizontal_swing_select) {
   this->horizontal_swing_select_ = horizontal_swing_select;
-  this->horizontal_swing_select_->add_on_state_callback([this](const std::string &value, size_t index) {
+  this->horizontal_swing_select_->add_on_state_callback([this](size_t index) {
     if (index == this->horizontal_swing_)
       return;
     this->set_horizontal_swing(static_cast<uint16_t>(index));
