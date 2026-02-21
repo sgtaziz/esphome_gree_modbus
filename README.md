@@ -4,7 +4,7 @@ ESPHome external component for controlling Gree commercial AC units via RS485 Mo
 
 ## Tested Hardware
 
-- **AC Unit**: Gree GU-Match series duct unit
+- **AC Unit**: Gree U-Match series duct unit
 - **Controller**: ESP32 / ESP8266 with RS485 transceiver (MAX485 or similar)
 - **Connection**: COM-BMS (CN3) daughter board on the indoor unit
 
