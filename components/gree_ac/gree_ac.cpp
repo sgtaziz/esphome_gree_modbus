@@ -65,6 +65,20 @@ void GreeAC::setup() {
     this->flow_control_pin_->digital_write(false);  // Start in receive mode
   }
 
+  // Custom fan modes are set on the Climate entity itself (the ClimateTraits
+  // setter is deprecated and removed in 2026.11.0). Use only custom fan modes
+  // (like sinclair_ac UART implementation) - the "0 - Auto" prefix prevents HA
+  // from treating it as standard FAN_AUTO.
+  this->set_supported_custom_fan_modes({
+      "0 - Auto",
+      "1 - Speed 1",
+      "2 - Speed 2",
+      "3 - Speed 3",
+      "4 - Speed 4",
+      "5 - Speed 5",
+      "6 - Turbo",
+  });
+
   // Assemble the register read plan based on which features are enabled.
   this->build_read_plan();
 
@@ -191,18 +205,6 @@ climate::ClimateTraits GreeAC::traits() {
     climate::CLIMATE_MODE_DRY,
     climate::CLIMATE_MODE_FAN_ONLY,
     climate::CLIMATE_MODE_HEAT_COOL,  // Auto mode
-  });
-
-  // Use only custom fan modes (like sinclair_ac UART implementation)
-  // "0 - Auto" prefix prevents HA from treating it as standard FAN_AUTO
-  traits.set_supported_custom_fan_modes({
-    "0 - Auto",
-    "1 - Speed 1",
-    "2 - Speed 2",
-    "3 - Speed 3",
-    "4 - Speed 4",
-    "5 - Speed 5",
-    "6 - Turbo",
   });
 
   // Swing modes
