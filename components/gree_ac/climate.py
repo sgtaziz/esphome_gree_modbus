@@ -238,6 +238,15 @@ async def to_code(config):
             sens = await sensor.new_sensor(sensor.sensor_schema(**schema_kwargs)(sens_conf))
             cg.add(getattr(var, f"set_{attr}_sensor")(sens))
 
+        # Ambient temp sensor selection (reg 39) as a decoded text sensor.
+        tss_conf = text_sensor.text_sensor_schema(text_sensor.TextSensor)(
+            {CONF_NAME: f"{climate_name} Temp Sensor Source".strip(),
+             CONF_ID: "gree_exposed_temp_sensor_select"}
+        )
+        tss = cg.new_Pvariable(tss_conf[CONF_ID])
+        await text_sensor.register_text_sensor(tss, tss_conf)
+        cg.add(var.set_temp_sensor_select_text_sensor(tss))
+
     # Debug mode: a text sensor dumping every register 0..92 as JSON.
     # debug_write implies debug_mode (the dump is needed to see what changed).
     if config.get(CONF_DEBUG_MODE) or config.get(CONF_DEBUG_WRITE):

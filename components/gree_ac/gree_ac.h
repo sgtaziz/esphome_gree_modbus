@@ -190,6 +190,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   void set_set_temp_precise_sensor(sensor::Sensor *s) { this->set_temp_precise_sensor_ = s; }
   void set_ambient_return_air_sensor(sensor::Sensor *s) { this->ambient_return_air_sensor_ = s; }
   void set_ambient_light_board_sensor(sensor::Sensor *s) { this->ambient_light_board_sensor_ = s; }
+  void set_temp_sensor_select_text_sensor(text_sensor::TextSensor *s) { this->temp_sensor_select_text_sensor_ = s; }
 
   // Debug entity setters
   void set_debug_text_sensor(text_sensor::TextSensor *s) { this->debug_text_sensor_ = s; }
@@ -279,6 +280,9 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   sensor::Sensor *set_temp_precise_sensor_{nullptr};
   sensor::Sensor *ambient_return_air_sensor_{nullptr};
   sensor::Sensor *ambient_light_board_sensor_{nullptr};
+
+  // Exposed text sensor: decoded ambient-temp sensor selection (reg 39)
+  text_sensor::TextSensor *temp_sensor_select_text_sensor_{nullptr};
 
   // Optional selects
   select::Select *vertical_swing_select_{nullptr};

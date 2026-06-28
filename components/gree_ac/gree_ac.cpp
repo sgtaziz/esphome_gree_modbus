@@ -126,6 +126,7 @@ void GreeAC::build_read_plan() {
     add(registers::SET_TEMP_PRECISE);     // reg 42
     add(registers::AMBIENT_RETURN_AIR);   // reg 82
     add(registers::AMBIENT_LIGHT_BOARD);  // reg 83
+    add(registers::TEMP_SENSOR_SELECT);   // reg 39 (decoded to a text sensor)
   }
 
   // Debug mode: sweep every address in range (debug reads the rest of 0..92)
@@ -708,7 +709,8 @@ void GreeAC::publish_exposed_sensors() {
       this->on_off_sensor_ == nullptr && this->sleep_sensor_ == nullptr &&
       this->turbo_sensor_ == nullptr && this->fresh_air_sensor_ == nullptr &&
       this->contamination_sensor_ == nullptr && this->set_temp_precise_sensor_ == nullptr &&
-      this->ambient_return_air_sensor_ == nullptr && this->ambient_light_board_sensor_ == nullptr)
+      this->ambient_return_air_sensor_ == nullptr && this->ambient_light_board_sensor_ == nullptr &&
+      this->temp_sensor_select_text_sensor_ == nullptr)
     return;
 
   auto publish_raw = [&](sensor::Sensor *s, uint16_t reg) {
@@ -733,6 +735,34 @@ void GreeAC::publish_exposed_sensors() {
   publish_scaled(this->set_temp_precise_sensor_, registers::SET_TEMP_PRECISE);
   publish_scaled(this->ambient_return_air_sensor_, registers::AMBIENT_RETURN_AIR);
   publish_scaled(this->ambient_light_board_sensor_, registers::AMBIENT_LIGHT_BOARD);
+
+  // Ambient temp sensor selection (reg 39) decoded to a readable string.
+  // Values are a bitmask: bit0 = air-return sensor, bit1 = wired controller.
+  if (this->temp_sensor_select_text_sensor_ != nullptr &&
+      this->register_valid_[registers::TEMP_SENSOR_SELECT]) {
+    uint16_t sel = this->register_cache_[registers::TEMP_SENSOR_SELECT];
+    std::string label;
+    switch (sel) {
+      case 0:
+        label = "None";
+        break;
+      case 1:
+        label = "Air Return (IDU)";
+        break;
+      case 2:
+        label = "Wired Controller";
+        break;
+      case 3:
+        label = "Air Return + Wired Controller (mode-dependent)";
+        break;
+      default:
+        char buf[16];
+        snprintf(buf, sizeof(buf), "Unknown (%u)", sel);
+        label = buf;
+        break;
+    }
+    this->temp_sensor_select_text_sensor_->publish_state(label);
+  }
 }
 
 void GreeAC::publish_debug_dump() {
