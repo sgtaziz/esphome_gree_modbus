@@ -6,6 +6,8 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include <cstring>
+#include <cstdio>
+#include <set>
 
 namespace esphome {
 namespace gree_ac {
@@ -63,8 +65,64 @@ void GreeAC::setup() {
     this->flow_control_pin_->digital_write(false);  // Start in receive mode
   }
 
+  // Assemble the register read plan based on which features are enabled.
+  this->build_read_plan();
+
   // Don't read registers here - it blocks too long and triggers watchdog
   // First read will happen in loop() after setup completes
+}
+
+void GreeAC::build_read_plan() {
+  // Front-load the core control registers, then add feature-driven ones.
+  // Dedupe via a set so registers shared by multiple features are read once.
+  std::vector<uint16_t> plan;
+  std::set<uint16_t> seen;
+
+  auto add = [&](uint16_t reg) {
+    if (seen.insert(reg).second)
+      plan.push_back(reg);
+  };
+
+  // Core control registers (always polled, in priority order)
+  add(registers::ON_OFF);
+  add(registers::MODE);
+  add(registers::TEMP_SENSOR_3);
+  add(registers::SET_TEMP);
+  add(registers::FAN_SPEED);
+  add(registers::VERTICAL_SWING);
+  add(registers::HORIZONTAL_SWING);
+  add(registers::SLEEP_MODE);
+  add(registers::FRESH_AIR_VALVE);
+
+  // Outdoor temp: polled if the outdoor sensor or an exposed-sensor view is configured
+  if (this->outdoor_temp_sensor_ != nullptr || this->expose_sensors_) {
+    add(registers::OUTDOOR_TEMP);
+  }
+
+  // Current-temp source select needs all four candidate registers cached
+  if (this->current_temp_source_select_ != nullptr) {
+    add(registers::AMBIENT_TEMP);          // reg 4
+    add(registers::AMBIENT_RETURN_AIR);    // reg 82
+    add(registers::AMBIENT_LIGHT_BOARD);   // reg 83
+  }
+
+  // Exposed sensors need a few extra decoded registers
+  if (this->expose_sensors_) {
+    add(registers::CONTAMINATION);        // reg 34
+    add(registers::SET_TEMP_PRECISE);     // reg 42
+    add(registers::AMBIENT_RETURN_AIR);   // reg 82
+    add(registers::AMBIENT_LIGHT_BOARD);  // reg 83
+  }
+
+  // Debug mode: sweep every address in range (debug reads the rest of 0..92)
+  if (this->debug_mode_) {
+    for (uint16_t a = registers::MIN_DEBUG_ADDR; a <= registers::MAX_DEBUG_ADDR; ++a) {
+      add(a);
+    }
+  }
+
+  this->read_plan_ = std::move(plan);
+  this->read_plan_index_ = 0;
 }
 
 void GreeAC::loop() {
@@ -76,6 +134,9 @@ void GreeAC::loop() {
       // Time to send next register request?
       uint32_t read_interval = this->update_interval_ / 10;
       if (read_interval < 100) read_interval = 100;
+      // In debug mode we sweep many more registers; slow the cadence to be
+      // gentle on the bus (full cycle ~14-18s instead of ~9s).
+      if (this->debug_mode_ && read_interval < 200) read_interval = 200;
 
       if (now - this->last_update_ >= read_interval) {
         this->last_update_ = now;
@@ -96,9 +157,18 @@ void GreeAC::dump_config() {
   ESP_LOGCONFIG(TAG, "  Version: %s", VERSION);
   ESP_LOGCONFIG(TAG, "  Slave ID: %d", this->slave_id_);
   ESP_LOGCONFIG(TAG, "  Update Interval: %d ms", this->update_interval_);
+  ESP_LOGCONFIG(TAG, "  Read plan size: %zu", this->read_plan_.size());
   if (this->flow_control_pin_ != nullptr) {
     LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
   }
+  if (this->current_temp_source_select_ != nullptr) {
+    ESP_LOGCONFIG(TAG, "  Current temp source: %s",
+                  CURRENT_TEMP_SOURCE_OPTIONS[static_cast<uint8_t>(this->current_temp_source_)].c_str());
+  }
+  if (this->expose_sensors_)
+    ESP_LOGCONFIG(TAG, "  Expose sensors: ON");
+  if (this->debug_mode_)
+    ESP_LOGCONFIG(TAG, "  Debug mode: ON");
   LOG_CLIMATE("", "Gree AC", this);
   if (this->outdoor_temp_sensor_ != nullptr) {
     LOG_SENSOR("  ", "Outdoor Temperature", this->outdoor_temp_sensor_);
@@ -350,8 +420,10 @@ void GreeAC::check_response() {
   // Check for timeout (500ms)
   if (now - this->request_start_time_ > 500) {
     ESP_LOGW(TAG, "No response reading register %d", this->pending_register_);
+    if (this->pending_register_ <= registers::MAX_DEBUG_ADDR)
+      this->register_valid_[this->pending_register_] = false;
     this->modbus_state_ = ModbusState::IDLE;
-    this->current_register_index_ = (this->current_register_index_ + 1) % 10;
+    this->advance_read_plan();
     return;
   }
 
@@ -363,11 +435,22 @@ void GreeAC::check_response() {
 
   // Check for frame complete (silence after receiving data)
   if (this->response_index_ > 0 && now - this->last_byte_time_ > 10) {
-    // Validate response
-    if (this->response_index_ >= 7 &&
-        this->response_buffer_[0] == this->slave_id_ &&
-        this->response_buffer_[1] == 0x03) {
+    bool handled = false;
 
+    // Validate response
+    if (this->response_index_ >= 5 &&
+        this->response_buffer_[0] == this->slave_id_ &&
+        (this->response_buffer_[1] & 0x80) == 0x80) {
+      // Modbus exception response (function | 0x80). Common when sweeping
+      // debug registers that don't exist on the unit.
+      uint8_t exception = this->response_buffer_[2];
+      ESP_LOGD(TAG, "Register %u returned Modbus exception %d", this->pending_register_, exception);
+      if (this->pending_register_ <= registers::MAX_DEBUG_ADDR)
+        this->register_valid_[this->pending_register_] = false;
+      handled = true;
+    } else if (this->response_index_ >= 7 &&
+               this->response_buffer_[0] == this->slave_id_ &&
+               this->response_buffer_[1] == 0x03) {
       // Verify CRC
       uint16_t rx_crc = this->response_buffer_[this->response_index_ - 2] |
                         (this->response_buffer_[this->response_index_ - 1] << 8);
@@ -379,54 +462,75 @@ void GreeAC::check_response() {
         this->process_register_response(this->pending_register_, value);
       } else {
         ESP_LOGW(TAG, "CRC mismatch reading register %d", this->pending_register_);
+        if (this->pending_register_ <= registers::MAX_DEBUG_ADDR)
+          this->register_valid_[this->pending_register_] = false;
       }
-    } else if (this->response_index_ > 0) {
+      handled = true;
+    } else {
       ESP_LOGW(TAG, "Invalid response reading register %d: %d bytes", this->pending_register_, this->response_index_);
     }
 
-    // Move to next register
-    this->modbus_state_ = ModbusState::IDLE;
-    this->current_register_index_ = (this->current_register_index_ + 1) % 10;
+    (void) handled;
 
-    // Publish state after last register
-    if (this->current_register_index_ == 0) {
-      // Determine action based on state
-      if (!this->ac_on_) {
-        this->action = climate::CLIMATE_ACTION_OFF;
-      } else if (this->mode_ == modes::FAN_ONLY) {
-        this->action = climate::CLIMATE_ACTION_FAN;
-      } else if (this->mode_ == modes::DRY) {
-        this->action = climate::CLIMATE_ACTION_DRYING;
-      } else if (this->mode_ == modes::COOL) {
-        if (this->current_temp_ > this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_COOLING;
-        } else {
-          this->action = climate::CLIMATE_ACTION_IDLE;
-        }
-      } else if (this->mode_ == modes::HEAT) {
-        if (this->current_temp_ < this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_HEATING;
-        } else {
-          this->action = climate::CLIMATE_ACTION_IDLE;
-        }
-      } else if (this->mode_ == modes::AUTO) {
-        // Auto mode: determine if heating or cooling based on temperature difference
-        if (this->current_temp_ > this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_COOLING;
-        } else if (this->current_temp_ < this->target_temp_) {
-          this->action = climate::CLIMATE_ACTION_HEATING;
-        } else {
-          this->action = climate::CLIMATE_ACTION_IDLE;
-        }
+    // Move to next register (advance_read_plan handles cycle-wrap publishing)
+    this->modbus_state_ = ModbusState::IDLE;
+    this->advance_read_plan();
+  }
+}
+
+void GreeAC::advance_read_plan() {
+  if (this->read_plan_.empty()) {
+    // Nothing to poll; nothing to do.
+    return;
+  }
+
+  this->read_plan_index_ = (this->read_plan_index_ + 1) % this->read_plan_.size();
+
+  // On cycle wrap: refresh derived climate action/state, exposed sensors, and debug dump.
+  if (this->read_plan_index_ == 0) {
+    // Determine action based on state
+    if (!this->ac_on_) {
+      this->action = climate::CLIMATE_ACTION_OFF;
+    } else if (this->mode_ == modes::FAN_ONLY) {
+      this->action = climate::CLIMATE_ACTION_FAN;
+    } else if (this->mode_ == modes::DRY) {
+      this->action = climate::CLIMATE_ACTION_DRYING;
+    } else if (this->mode_ == modes::COOL) {
+      if (this->current_temp_ > this->target_temp_) {
+        this->action = climate::CLIMATE_ACTION_COOLING;
       } else {
         this->action = climate::CLIMATE_ACTION_IDLE;
       }
-      this->publish_state();
+    } else if (this->mode_ == modes::HEAT) {
+      if (this->current_temp_ < this->target_temp_) {
+        this->action = climate::CLIMATE_ACTION_HEATING;
+      } else {
+        this->action = climate::CLIMATE_ACTION_IDLE;
+      }
+    } else if (this->mode_ == modes::AUTO) {
+      // Auto mode: determine if heating or cooling based on temperature difference
+      if (this->current_temp_ > this->target_temp_) {
+        this->action = climate::CLIMATE_ACTION_COOLING;
+      } else if (this->current_temp_ < this->target_temp_) {
+        this->action = climate::CLIMATE_ACTION_HEATING;
+      } else {
+        this->action = climate::CLIMATE_ACTION_IDLE;
+      }
+    } else {
+      this->action = climate::CLIMATE_ACTION_IDLE;
     }
+    this->publish_state();
+
+    this->publish_exposed_sensors();
+    this->publish_debug_dump();
   }
 }
 
 void GreeAC::process_register_response(uint16_t reg_addr, uint16_t value) {
+  // Cache the raw value for every successful read (powers debug dump, the
+  // current-temp source select, and exposed ambient sensors).
+  this->store_register(reg_addr, value);
+
   switch (reg_addr) {
     case registers::ON_OFF:
       this->ac_on_ = (value == AC_ON);
@@ -456,13 +560,14 @@ void GreeAC::process_register_response(uint16_t reg_addr, uint16_t value) {
       }
       break;
 
+    // Any of the four candidate current-temp registers may supply
+    // current_temperature, depending on the selected source. Recompute from
+    // the cache only when this read matches the active source.
     case registers::TEMP_SENSOR_3:
-      if (value & 0x8000) {
-        this->current_temp_ = -static_cast<float>(value & 0x7FFF) / 10.0f;
-      } else {
-        this->current_temp_ = static_cast<float>(value) / 10.0f;
-      }
-      this->current_temperature = this->current_temp_;
+    case registers::AMBIENT_TEMP:
+    case registers::AMBIENT_RETURN_AIR:
+    case registers::AMBIENT_LIGHT_BOARD:
+      this->recompute_current_temp();
       break;
 
     case registers::SET_TEMP:
@@ -555,6 +660,110 @@ void GreeAC::process_register_response(uint16_t reg_addr, uint16_t value) {
       }
       break;
   }
+}
+
+void GreeAC::store_register(uint16_t addr, uint16_t value) {
+  if (addr <= registers::MAX_DEBUG_ADDR) {
+    this->register_cache_[addr] = value;
+    this->register_valid_[addr] = true;
+  }
+}
+
+float GreeAC::compute_current_temp_from_cache() const {
+  uint16_t reg = registers::TEMP_SENSOR_3;
+  float scale = 10.0f;
+  bool sign = true;
+  switch (this->current_temp_source_) {
+    case CurrentTempSource::WIRED_CONTROLLER:
+      reg = registers::TEMP_SENSOR_3;      scale = 10.0f; sign = true;  break;
+    case CurrentTempSource::IDU_RETURN_AIR:
+      reg = registers::AMBIENT_TEMP;       scale = 1.0f;  sign = false; break;
+    case CurrentTempSource::RETURN_AIR_PORT:
+      reg = registers::AMBIENT_RETURN_AIR; scale = 10.0f; sign = true;  break;
+    case CurrentTempSource::LIGHT_BOARD:
+      reg = registers::AMBIENT_LIGHT_BOARD; scale = 10.0f; sign = true;  break;
+  }
+  if (reg > registers::MAX_DEBUG_ADDR || !this->register_valid_[reg])
+    return this->current_temp_;  // keep last known value when source data is missing
+  uint16_t v = this->register_cache_[reg];
+  if (sign && (v & 0x8000))
+    return -static_cast<float>(v & 0x7FFF) / scale;
+  return static_cast<float>(v) / scale;
+}
+
+void GreeAC::recompute_current_temp() {
+  float temp = this->compute_current_temp_from_cache();
+  if (temp == this->current_temp_)
+    return;
+  this->current_temp_ = temp;
+  this->current_temperature = temp;
+}
+
+void GreeAC::publish_exposed_sensors() {
+  // Only published when at least one exposed sensor is configured.
+  if (this->set_point_sensor_ == nullptr && this->current_temp_sensor_ == nullptr &&
+      this->mode_sensor_ == nullptr && this->fan_speed_sensor_ == nullptr &&
+      this->on_off_sensor_ == nullptr && this->sleep_sensor_ == nullptr &&
+      this->turbo_sensor_ == nullptr && this->fresh_air_sensor_ == nullptr &&
+      this->contamination_sensor_ == nullptr && this->set_temp_precise_sensor_ == nullptr &&
+      this->ambient_return_air_sensor_ == nullptr && this->ambient_light_board_sensor_ == nullptr)
+    return;
+
+  auto publish_raw = [&](sensor::Sensor *s, uint16_t reg) {
+    if (s != nullptr && reg <= registers::MAX_DEBUG_ADDR && this->register_valid_[reg])
+      s->publish_state(static_cast<float>(this->register_cache_[reg]));
+  };
+  // Temperature registers stored ×10 get scaled to degrees here.
+  auto publish_scaled = [&](sensor::Sensor *s, uint16_t reg) {
+    if (s != nullptr && reg <= registers::MAX_DEBUG_ADDR && this->register_valid_[reg])
+      s->publish_state(static_cast<float>(this->register_cache_[reg]) / 10.0f);
+  };
+
+  if (this->set_point_sensor_) this->set_point_sensor_->publish_state(this->target_temp_);
+  if (this->current_temp_sensor_) this->current_temp_sensor_->publish_state(this->current_temp_);
+  if (this->mode_sensor_) this->mode_sensor_->publish_state(static_cast<float>(this->mode_));
+  if (this->fan_speed_sensor_) this->fan_speed_sensor_->publish_state(static_cast<float>(this->fan_speed_));
+  if (this->on_off_sensor_) this->on_off_sensor_->publish_state(this->ac_on_ ? 1.0f : 0.0f);
+  if (this->sleep_sensor_) this->sleep_sensor_->publish_state(this->sleep_mode_ ? 1.0f : 0.0f);
+  if (this->turbo_sensor_) this->turbo_sensor_->publish_state(this->turbo_mode_ ? 1.0f : 0.0f);
+  if (this->fresh_air_sensor_) this->fresh_air_sensor_->publish_state(this->fresh_air_ ? 1.0f : 0.0f);
+  publish_raw(this->contamination_sensor_, registers::CONTAMINATION);
+  publish_scaled(this->set_temp_precise_sensor_, registers::SET_TEMP_PRECISE);
+  publish_scaled(this->ambient_return_air_sensor_, registers::AMBIENT_RETURN_AIR);
+  publish_scaled(this->ambient_light_board_sensor_, registers::AMBIENT_LIGHT_BOARD);
+}
+
+void GreeAC::publish_debug_dump() {
+  if (this->debug_text_sensor_ == nullptr)
+    return;
+  std::string s = "{";
+  char buf[24];
+  for (uint16_t a = registers::MIN_DEBUG_ADDR; a <= registers::MAX_DEBUG_ADDR; ++a) {
+    if (a > registers::MIN_DEBUG_ADDR)
+      s += ",";
+    if (this->register_valid_[a])
+      snprintf(buf, sizeof(buf), "\"%u\":%u", a, this->register_cache_[a]);
+    else
+      snprintf(buf, sizeof(buf), "\"%u\":null", a);
+    s += buf;
+  }
+  s += "}";
+  this->debug_text_sensor_->publish_state(s);
+}
+
+void GreeAC::handle_debug_write() {
+  if (this->debug_address_number_ == nullptr || this->debug_value_number_ == nullptr)
+    return;
+  if (!this->debug_address_number_->has_state() || !this->debug_value_number_->has_state())
+    return;
+  uint16_t addr = static_cast<uint16_t>(this->debug_address_number_->state);
+  uint16_t val = static_cast<uint16_t>(this->debug_value_number_->state);
+  ESP_LOGW(TAG, "DEBUG WRITE register %u = %u", addr, val);
+  bool ok = this->write_register(addr, val);
+  if (ok)
+    ESP_LOGI(TAG, "Debug write OK (reg %u)", addr);
+  else
+    ESP_LOGE(TAG, "Debug write FAILED (reg %u)", addr);
 }
 
 bool GreeAC::read_register(uint16_t reg_addr, uint16_t *value) {
@@ -822,45 +1031,11 @@ void GreeAC::read_all_registers() {
 }
 
 void GreeAC::read_next_register() {
-  // Dispatch async read request based on current register index
-  // Response will be handled by check_response() -> process_register_response()
-  switch (this->current_register_index_) {
-    case 0:
-      this->send_read_request(registers::ON_OFF);
-      break;
-    case 1:
-      this->send_read_request(registers::MODE);
-      break;
-    case 2:
-      this->send_read_request(registers::TEMP_SENSOR_3);
-      break;
-    case 3:
-      this->send_read_request(registers::SET_TEMP);
-      break;
-    case 4:
-      this->send_read_request(registers::FAN_SPEED);
-      break;
-    case 5:
-      this->send_read_request(registers::VERTICAL_SWING);
-      break;
-    case 6:
-      this->send_read_request(registers::HORIZONTAL_SWING);
-      break;
-    case 7:
-      // Skip outdoor temp if sensor not configured
-      if (this->outdoor_temp_sensor_ != nullptr) {
-        this->send_read_request(registers::OUTDOOR_TEMP);
-      } else {
-        this->current_register_index_ = (this->current_register_index_ + 1) % 10;
-      }
-      break;
-    case 8:
-      this->send_read_request(registers::SLEEP_MODE);
-      break;
-    case 9:
-      this->send_read_request(registers::FRESH_AIR_VALVE);
-      break;
-  }
+  // Dispatch an async read request for the current entry in the read plan.
+  // Response is handled by check_response() -> process_register_response().
+  if (this->read_plan_.empty())
+    return;
+  this->send_read_request(this->read_plan_[this->read_plan_index_]);
 }
 
 void GreeAC::set_vertical_swing(uint16_t value) {
@@ -939,6 +1114,37 @@ void GreeAC::set_fresh_air_switch(switch_::Switch *fresh_air_switch) {
       return;
     this->set_fresh_air(state);
   });
+}
+
+void GreeAC::set_current_temp_source_select(select::Select *select) {
+  this->current_temp_source_select_ = select;
+  // The select reports the chosen option as its index, which maps 1:1 to the
+  // CurrentTempSource enum order. Recompute current_temperature instantly from
+  // the cached register values on change.
+  this->current_temp_source_select_->add_on_state_callback([this](size_t index) {
+    if (index >= CURRENT_TEMP_SOURCE_OPTIONS.size())
+      return;
+    CurrentTempSource new_source = static_cast<CurrentTempSource>(index);
+    if (new_source == this->current_temp_source_)
+      return;
+    this->current_temp_source_ = new_source;
+    ESP_LOGI(TAG, "Current temp source set to %s", CURRENT_TEMP_SOURCE_OPTIONS[index].c_str());
+    this->recompute_current_temp();
+    this->publish_state();
+  });
+}
+
+void GreeAC::set_debug_address_number(number::Number *address_number) {
+  this->debug_address_number_ = address_number;
+}
+
+void GreeAC::set_debug_value_number(number::Number *value_number) {
+  this->debug_value_number_ = value_number;
+}
+
+void GreeAC::set_debug_write_button(button::Button *write_button) {
+  this->debug_write_button_ = write_button;
+  this->debug_write_button_->add_on_press_callback([this]() { this->handle_debug_write(); });
 }
 
 }  // namespace gree_ac

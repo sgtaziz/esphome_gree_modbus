@@ -35,6 +35,11 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/select/select.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/number/number.h"
+#include "esphome/components/button/button.h"
+#include <array>
+#include <vector>
 
 namespace esphome {
 namespace gree_ac {
@@ -71,6 +76,11 @@ namespace registers {
   static const uint16_t DRED_FUNCTION = 77;
   static const uint16_t AMBIENT_RETURN_AIR = 82;
   static const uint16_t AMBIENT_LIGHT_BOARD = 83;
+
+  // Debug register sweep range (inclusive). Cache has MAX- MIN + 1 slots.
+  static const uint16_t MIN_DEBUG_ADDR = 0;
+  static const uint16_t MAX_DEBUG_ADDR = 92;
+  static const uint16_t DEBUG_REG_COUNT = MAX_DEBUG_ADDR - MIN_DEBUG_ADDR + 1;
 }
 
 // On/Off values
@@ -96,6 +106,22 @@ namespace fan_speeds {
   static const uint16_t SPEED_5 = 5;
   static const uint16_t TURBO = 6;
 }
+
+// Selectable sources for the climate's current_temperature value
+enum class CurrentTempSource : uint8_t {
+  WIRED_CONTROLLER = 0,  // reg 3 (TEMP_SENSOR_3), ÷10, signed
+  IDU_RETURN_AIR,        // reg 4 (AMBIENT_TEMP), ÷1
+  RETURN_AIR_PORT,       // reg 82 (AMBIENT_RETURN_AIR), ÷10, signed
+  LIGHT_BOARD,           // reg 83 (AMBIENT_LIGHT_BOARD), ÷10, signed
+};
+
+// Options for the current-temp source select (index matches CurrentTempSource enum)
+static const std::vector<std::string> CURRENT_TEMP_SOURCE_OPTIONS = {
+    "Wired Controller",
+    "IDU Return Air",
+    "Return Air Port",
+    "Light Board",
+};
 
 // Vertical swing options (from XML)
 static const std::vector<std::string> VERTICAL_SWING_OPTIONS = {
@@ -145,6 +171,31 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   void set_sleep_switch(switch_::Switch *sw);
   void set_turbo_switch(switch_::Switch *sw);
   void set_fresh_air_switch(switch_::Switch *sw);
+  void set_current_temp_source_select(select::Select *select);
+
+  // Feature flags
+  void set_expose_sensors(bool v) { this->expose_sensors_ = v; }
+  void set_debug_mode(bool v) { this->debug_mode_ = v; }
+
+  // Exposed-sensor setters (each optional)
+  void set_set_point_sensor(sensor::Sensor *s) { this->set_point_sensor_ = s; }
+  void set_current_temp_sensor(sensor::Sensor *s) { this->current_temp_sensor_ = s; }
+  void set_mode_sensor(sensor::Sensor *s) { this->mode_sensor_ = s; }
+  void set_fan_speed_sensor(sensor::Sensor *s) { this->fan_speed_sensor_ = s; }
+  void set_on_off_sensor(sensor::Sensor *s) { this->on_off_sensor_ = s; }
+  void set_sleep_sensor(sensor::Sensor *s) { this->sleep_sensor_ = s; }
+  void set_turbo_sensor(sensor::Sensor *s) { this->turbo_sensor_ = s; }
+  void set_fresh_air_sensor(sensor::Sensor *s) { this->fresh_air_sensor_ = s; }
+  void set_contamination_sensor(sensor::Sensor *s) { this->contamination_sensor_ = s; }
+  void set_set_temp_precise_sensor(sensor::Sensor *s) { this->set_temp_precise_sensor_ = s; }
+  void set_ambient_return_air_sensor(sensor::Sensor *s) { this->ambient_return_air_sensor_ = s; }
+  void set_ambient_light_board_sensor(sensor::Sensor *s) { this->ambient_light_board_sensor_ = s; }
+
+  // Debug entity setters
+  void set_debug_text_sensor(text_sensor::TextSensor *s) { this->debug_text_sensor_ = s; }
+  void set_debug_address_number(number::Number *n);
+  void set_debug_value_number(number::Number *n);
+  void set_debug_write_button(button::Button *b);
 
   // Modbus communication
   bool read_register(uint16_t reg_addr, uint16_t *value);
@@ -168,22 +219,37 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // State update
   void update_state();
   void read_all_registers();
-  void read_next_register();  // Non-blocking: reads one register per call
+  void read_next_register();  // Non-blocking: reads one register per call (from read_plan_)
+  void build_read_plan();     // Assembles read_plan_ based on enabled features
 
   // Async Modbus methods
   void send_read_request(uint16_t reg_addr);  // Non-blocking: sends request
   void check_response();  // Non-blocking: checks for response data
+  void advance_read_plan();  // Wraps read_plan_index_ and publishes on cycle wrap
   void process_register_response(uint16_t reg_addr, uint16_t value);  // Handles received data
+
+  // Register cache helpers (indexed by register address)
+  void store_register(uint16_t addr, uint16_t value);
+  float compute_current_temp_from_cache() const;
+  void recompute_current_temp();
+  void publish_exposed_sensors();
+  void publish_debug_dump();
+  void handle_debug_write();
 
   // Configuration
   uint8_t slave_id_{MODBUS_DEFAULT_SLAVE_ID};
   uint32_t update_interval_{5000};  // 5 seconds default
   GPIOPin *flow_control_pin_{nullptr};  // DE/RE pin for MAX485 modules
+  bool expose_sensors_{false};
+  bool debug_mode_{false};
 
   // Timing
   uint32_t last_update_{0};
   uint32_t last_request_{0};
-  uint8_t current_register_index_{0};  // For non-blocking sequential register reads
+
+  // Dynamic read plan (replaces the old fixed 10-index switch)
+  std::vector<uint16_t> read_plan_;
+  size_t read_plan_index_{0};
 
   // Async Modbus state machine
   enum class ModbusState : uint8_t {
@@ -200,14 +266,39 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   // Optional sensors
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
 
+  // Exposed sensors (gated by expose_sensors_)
+  sensor::Sensor *set_point_sensor_{nullptr};
+  sensor::Sensor *current_temp_sensor_{nullptr};
+  sensor::Sensor *mode_sensor_{nullptr};
+  sensor::Sensor *fan_speed_sensor_{nullptr};
+  sensor::Sensor *on_off_sensor_{nullptr};
+  sensor::Sensor *sleep_sensor_{nullptr};
+  sensor::Sensor *turbo_sensor_{nullptr};
+  sensor::Sensor *fresh_air_sensor_{nullptr};
+  sensor::Sensor *contamination_sensor_{nullptr};
+  sensor::Sensor *set_temp_precise_sensor_{nullptr};
+  sensor::Sensor *ambient_return_air_sensor_{nullptr};
+  sensor::Sensor *ambient_light_board_sensor_{nullptr};
+
   // Optional selects
   select::Select *vertical_swing_select_{nullptr};
   select::Select *horizontal_swing_select_{nullptr};
+  select::Select *current_temp_source_select_{nullptr};
 
   // Optional switches
   switch_::Switch *sleep_switch_{nullptr};
   switch_::Switch *turbo_switch_{nullptr};
   switch_::Switch *fresh_air_switch_{nullptr};
+
+  // Debug entities
+  text_sensor::TextSensor *debug_text_sensor_{nullptr};
+  number::Number *debug_address_number_{nullptr};
+  number::Number *debug_value_number_{nullptr};
+  button::Button *debug_write_button_{nullptr};
+
+  // Raw register cache (indexed by register address, 0..MAX_DEBUG_ADDR)
+  std::array<uint16_t, registers::DEBUG_REG_COUNT> register_cache_{};
+  std::array<bool, registers::DEBUG_REG_COUNT> register_valid_{};  // false until first successful read
 
   // Cached state
   bool ac_on_{false};
@@ -221,6 +312,7 @@ class GreeAC : public Component, public uart::UARTDevice, public climate::Climat
   bool sleep_mode_{false};
   bool turbo_mode_{false};
   bool fresh_air_{false};
+  CurrentTempSource current_temp_source_{CurrentTempSource::WIRED_CONTROLLER};
 };
 
 }  // namespace gree_ac

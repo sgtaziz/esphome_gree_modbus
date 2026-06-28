@@ -68,6 +68,32 @@ climate:
     fresh_air_switch:
       name: "${friendly_name} Fresh Air"
 
+    # ----------------------------------------------------------------
+    # Troubleshooting / reverse-engineering helpers (all optional)
+    # ----------------------------------------------------------------
+
+    # Expose individual sensors (set point, current temp, mode, fan speed,
+    # power state, sleep, turbo, fresh air, contamination, precise set temp,
+    # ambient return-air & light-board temps). Each is named
+    # "${friendly_name} <label>".
+    expose_sensors: true
+
+    # Select which register feeds the climate's current_temperature.
+    # Options: Wired Controller (reg 3), IDU Return Air (reg 4),
+    #          Return Air Port (reg 82), Light Board (reg 83)
+    current_temp_source:
+      name: "${friendly_name} Current Temp Source"
+
+    # Debug mode: dumps every register 0-92 as a JSON text sensor once per
+    # poll cycle. Unreadable registers show as null. Enable to map out the
+    # register space.
+    debug_mode: false
+
+    # Debug write: adds a register-address number (0-92), a register-value
+    # number (0-65535), and a write button to write any register. Implies
+    # debug_mode. Use with care - writes go straight to the unit.
+    debug_write: false
+
 # Diagnostic sensors
 sensor:
   - platform: wifi_signal
